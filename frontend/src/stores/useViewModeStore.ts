@@ -18,9 +18,9 @@ const STORAGE_KEY = 'oe_view_mode';
 function readMode(): ViewMode {
   try {
     const v = localStorage.getItem(STORAGE_KEY);
-    return v === 'simple' ? 'simple' : 'advanced';
+    return v === 'simple' || v === 'advanced' ? v : 'simple';
   } catch {
-    return 'advanced';
+    return 'simple';
   }
 }
 

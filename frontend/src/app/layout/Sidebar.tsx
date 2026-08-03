@@ -836,6 +836,21 @@ const adminGridItems: NavItem[] = [
   { labelKey: 'sidebar.admin_grid.about', to: '/about', icon: Info },
 ];
 
+// Simple mode — flat SIGNAL-style list of the 7 core entry points.
+// Rendered instead of the 19 thematic groups whenever the view mode is
+// "simple" (the default). Every `to` is cross-checked against App.tsx
+// routes; badges/tooltips reuse the same keys as the grouped nav so the
+// simple list and the advanced menu stay in sync.
+const SIMPLE_NAV_ITEMS: NavItem[] = [
+  { labelKey: 'nav.dashboard', to: '/', icon: LayoutDashboard },
+  { labelKey: 'projects.title', to: '/projects', icon: FolderOpen },
+  { labelKey: 'nav.project_files', to: '/files', icon: HardDrive },
+  { labelKey: 'nav.bim_viewer', to: '/bim', icon: Box },
+  { labelKey: 'construction_control.title', to: '/construction-control', icon: Construction },
+  { labelKey: 'tasks.title', to: '/tasks', icon: ClipboardList },
+  { labelKey: 'finance.title', to: '/finance', icon: Wallet },
+];
+
 /** Flat lookup of every NavItem in the sidebar, keyed by `to`. The
  *  Pinned section uses this to resolve a stored route string into a
  *  full NavItem (with icon, labelKey, badge etc.) without duplicating
@@ -1709,6 +1724,77 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
         </button>
       </div>
 
+      {/* Simple / Advanced view-mode switch — lets the user flip between
+          the flat 7-item SIGNAL-style menu and the full 19-group menu.
+          Sits right under Search so it is discoverable, but stays compact
+          (two small pills) so it never reads as nav itself. Iconified
+          mode collapses to a single toggle button that flips the mode. */}
+      <div className={clsx('pt-1 pb-0.5', iconified ? 'px-2 flex justify-center' : 'px-3')}>
+        {iconified ? (
+          <button
+            type="button"
+            onClick={() => setViewMode(isAdvanced ? 'simple' : 'advanced')}
+            title={
+              isAdvanced
+                ? t('nav.mode_simple', { defaultValue: 'Simple' })
+                : t('nav.mode_advanced', { defaultValue: 'Advanced' })
+            }
+            aria-label={
+              isAdvanced
+                ? t('nav.mode_simple', { defaultValue: 'Simple' })
+                : t('nav.mode_advanced', { defaultValue: 'Advanced' })
+            }
+            className={clsx(
+              'flex h-8 w-8 items-center justify-center rounded-md border text-content-tertiary transition-colors',
+              isAdvanced
+                ? 'border-border-light bg-surface-secondary/60 hover:text-content-primary'
+                : 'border-oe-blue/30 bg-oe-blue/10 text-oe-blue',
+            )}
+          >
+            <SlidersHorizontal size={13} strokeWidth={1.75} />
+          </button>
+        ) : (
+          <div
+            role="group"
+            aria-label={t('nav.view_mode', { defaultValue: 'View mode' })}
+            className="flex w-full items-center gap-0.5 rounded-lg border border-border-light bg-surface-secondary/40 p-0.5"
+          >
+            <button
+              type="button"
+              onClick={() => setViewMode('simple')}
+              aria-pressed={!isAdvanced}
+              className={clsx(
+                'flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors',
+                !isAdvanced
+                  ? 'bg-surface-primary text-oe-blue shadow-sm'
+                  : 'text-content-tertiary hover:text-content-primary',
+              )}
+            >
+              <LayoutDashboard size={11} strokeWidth={2} className="shrink-0" />
+              <span className="truncate">
+                {t('nav.mode_simple', { defaultValue: 'Simple' })}
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode('advanced')}
+              aria-pressed={isAdvanced}
+              className={clsx(
+                'flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors',
+                isAdvanced
+                  ? 'bg-surface-primary text-oe-blue shadow-sm'
+                  : 'text-content-tertiary hover:text-content-primary',
+              )}
+            >
+              <SlidersHorizontal size={11} strokeWidth={2} className="shrink-0" />
+              <span className="truncate">
+                {t('nav.mode_advanced', { defaultValue: 'Advanced' })}
+              </span>
+            </button>
+          </div>
+        )}
+      </div>
+
       {/* Main navigation — grouped with collapsible headers.
           role="navigation" + aria-label make this an addressable
           landmark for screen readers; previously the sidebar was just
@@ -1764,12 +1850,49 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
             )}
           </div>
         )}
+        {/* Simple mode — the flat SIGNAL-style 7-item list. Rendered in
+            place of the 19 thematic groups below whenever the view mode is
+            "simple" (the default). Project-focus annotation and pinning
+            work exactly as in the grouped view. */}
+        {!isAdvanced && (
+          <ul className="space-y-0.5">
+            {SIMPLE_NAV_ITEMS.map((item, i) => {
+              const g = gate.active && !iconified ? gate.byRoute(item.to) : null;
+              const notNeeded = g != null && !g.enabled;
+              const needed = g != null && g.enabled;
+              const seq = needed ? (routeSeq += 1) : null;
+              return (
+                <li
+                  key={item.to}
+                  className="oe-stagger"
+                  style={{ animationDelay: `${i * 18}ms` }}
+                >
+                  <SidebarItem
+                    item={item}
+                    label={t(item.labelKey, { defaultValue: item.defaultLabel })}
+                    onClick={onClose}
+                    badge={badgeMap[item.to]}
+                    seq={seq}
+                    compact={notNeeded}
+                    isPinned={pinned.includes(item.to)}
+                    onTogglePin={togglePin}
+                    activeRoute={activeRoute}
+                    iconified={iconified}
+                    editMode={editMode}
+                    isItemHidden={editingHidden.includes(item.to)}
+                    onToggleHidden={toggleItemHidden}
+                  />
+                </li>
+              );
+            })}
+          </ul>
+        )}
         {/* Project focus is applied IN PLACE inside the original groups
             below — there is NO separate "project route" section and no
             reordering. Each row is only annotated: needed → sequence
             number; not needed → smaller + greyed; unconstrained → as
             default. Focus OFF / no profile → every row is default. */}
-        {navGroups.map((group) => {
+        {isAdvanced && navGroups.map((group) => {
           // Hide entire group in simple mode if flagged
           if (group.hideInSimple && !isAdvanced) return null;
 
