@@ -102,6 +102,7 @@ import {
   Construction,
   Handshake,
   FileWarning,
+  Calculator,
   type LucideIcon,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/useAuthStore';
@@ -849,6 +850,7 @@ const SIMPLE_NAV_ITEMS: NavItem[] = [
   { labelKey: 'construction_control.title', to: '/construction-control', icon: Construction },
   { labelKey: 'tasks.title', to: '/tasks', icon: ClipboardList },
   { labelKey: 'finance.title', to: '/finance', icon: Wallet },
+  { labelKey: 'nav.estimator_crm', to: '/estimator', icon: Calculator },
 ];
 
 /** Flat lookup of every NavItem in the sidebar, keyed by `to`. The

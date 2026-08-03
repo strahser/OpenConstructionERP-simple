@@ -8434,6 +8434,7 @@ const resource = {
     "nav.mode_simple": "Простой",
     "nav.mode_std_badge": "STD",
     "nav.modules": "Модули",
+    "nav.estimator_crm": "Сметчик",
     "nav.projects": "Проекты",
     "nav.reports": "Отчёты",
     "nav.resource_catalog": "Каталог ресурсов",

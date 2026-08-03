@@ -42,6 +42,7 @@ import { manifest as regionalExchange } from './regional-exchange/manifest';
 import { manifest as ddcIfcConverter } from './ddc-ifc-converter/manifest';
 import { manifest as ddcRvtConverter } from './ddc-rvt-converter/manifest';
 import { manifest as pipelines } from './pipelines/manifest';
+import { manifest as estimatorCrm } from './estimator-crm/manifest';
 
 /* ── Registry ──────────────────────────────────────────────────────── */
 
@@ -63,6 +64,7 @@ export const MODULE_REGISTRY: ModuleManifest[] = [
   ddcIfcConverter,
   ddcRvtConverter,
   pipelines,
+  estimatorCrm,
 ];
 
 /* ── Helper functions ──────────────────────────────────────────────── */
