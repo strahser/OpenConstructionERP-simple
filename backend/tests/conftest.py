@@ -1,0 +1,507 @@
+"""Shared test fixtures.
+
+Test isolation
+~~~~~~~~~~~~~~
+Per ``feedback_test_isolation.md``: backend tests must NEVER touch the
+production database. Several integration suites
+(``test_api_smoke``, ``test_boq_regression``, ``test_boq_import_safety``,
+``test_boq_cycle_detection``, ``test_boq_cost_item_link``) construct the
+FastAPI app via ``create_app()`` which imports ``app.database`` and
+binds ``async_session_factory`` to whatever ``DATABASE_URL`` is set at
+that moment — so the env vars have to point at a throwaway PostgreSQL
+cluster *before* any ``from app...`` import runs.
+
+Doing it here in ``tests/conftest.py`` (which pytest loads before any
+test module) guarantees the override beats every test-module import
+order, regardless of which suite is collected first. Tests that already
+self-redirect (``test_tenant_isolation``, ``test_register_bootstrap``,
+etc.) are still fine — they overwrite this with their own connection.
+"""
+
+import inspect
+import os
+
+# ── Windows asyncpg event-loop policy ──────────────────────────────────────
+# On Windows the default ProactorEventLoop leaves asyncpg socket transports to
+# be finalized by the GC after the per-test loop has closed, surfacing as a
+# noisy "RuntimeError: Event loop is closed" at teardown. The SelectorEventLoop
+# policy (the default on Linux/macOS) closes them deterministically. Must run
+# before any event loop is created.
+import sys as _sys  # noqa: E402
+import tempfile
+from pathlib import Path
+
+if _sys.platform == "win32":
+    import asyncio as _asyncio
+
+    _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
+
+# ── Per-session PostgreSQL isolation (must run before app imports) ──────────
+# The app is PostgreSQL-only at runtime, so the test suite runs on PostgreSQL
+# too. Two ways to provide it:
+#   * CI sets ``DATABASE_URL`` (a postgres service container) — honour it as-is.
+#   * Otherwise boot a throwaway embedded PostgreSQL 16 cluster (no Docker) into
+#     a temp data dir for the session. ``embedded_pg.boot`` points
+#     ``DATABASE_URL`` / ``DATABASE_SYNC_URL`` at the embedded cluster and is
+#     registered for shutdown via ``atexit`` so the postmaster is stopped when
+#     the run ends (the temp dir is reclaimed by the OS regardless).
+# This must happen before any ``from app...`` import that pulls in
+# ``app.database`` (which builds the engine from ``settings.database_url`` at
+# import time).
+if not os.environ.get("DATABASE_URL", "").strip():
+    import atexit
+
+    from app.core import embedded_pg
+
+    _PG_DATA_DIR = Path(tempfile.mkdtemp(prefix="oe-tests-pg-"))
+    if not embedded_pg.boot(_PG_DATA_DIR):
+        raise RuntimeError(
+            "could not boot embedded PostgreSQL for the test session; set "
+            "DATABASE_URL to point the suite at an external PostgreSQL instead"
+        )
+    # One cluster serves the whole session, so the application's shutdown handler
+    # must leave it alone: without this pin the first test that exercises the app
+    # lifespan stops the postmaster and every test after it errors on connect.
+    embedded_pg.retain()
+    atexit.register(lambda: embedded_pg.shutdown(force=True))
+
+# ── Rate-limiter relaxation for tests ──────────────────────────────────────
+# The integration suites repeatedly hit ``/auth/register`` and ``/auth/login``
+# from the same in-process ``test`` client. The default 10/min login limit
+# (and 100/min API limit) is fine for production but makes whole-suite
+# runs flake with 429s long before the relevant assertion fires. Tests
+# don't measure rate-limiter behaviour itself (those tests stand up their
+# own ``RateLimiter(...)`` instance), so we lift the bucket here.
+os.environ.setdefault("LOGIN_RATE_LIMIT", "10000")
+os.environ.setdefault("API_RATE_LIMIT", "100000")
+os.environ.setdefault("AI_RATE_LIMIT", "10000")
+
+# ── Open registration for the suite ────────────────────────────────────────
+# The default registration mode is "admin-approve" (every registrant after the
+# first bootstrap admin is created inactive and cannot log in). The integration
+# suites register a fresh user per module and immediately log in, so under the
+# default they get a 401 and the auth fixture errors out. Open mode keeps every
+# registrant active. The two mode-specific suites (test_register_modes,
+# test_register_bootstrap) set the mode themselves and are unaffected.
+os.environ.setdefault("REGISTRATION_MODE", "open")
+
+# ── Skip demo account seeding for tests ───────────────────────────────────
+# The startup lifespan creates demo@openconstructionerp.com (and two sibling
+# accounts) every time create_app() boots. Although has_admin() is designed
+# to exclude those demo emails from the bootstrap check, the seeding still
+# costs time and writes rows that can interact with per-module auth fixtures.
+# test_demo_login_endpoint.py sets SEED_DEMO=true inside its own fixture and
+# is unaffected. All other suites work without the demo accounts.
+os.environ.setdefault("SEED_DEMO", "false")
+
+# ── Fast app startup for tests ─────────────────────────────────────────────
+# Each integration module stands up its own FastAPI app via create_app() and
+# runs the full lifespan. In production that lifespan connects to the vector
+# backend, loads the embedding model (~35s) and installs the flagship showcase
+# project (6640 elements + ~16MB of geometry). None of that is needed by the
+# test suite, and paid per module it is the dominant cost of the whole run.
+# This flag skips the vector init/warm-up and the flagship seed; vector
+# endpoints still work because the embedder loads lazily on first use.
+os.environ.setdefault("OE_TEST_FAST_STARTUP", "1")
+
+# ── NullPool for the shared app engine under tests ─────────────────────────
+# pytest-asyncio runs each test in its own event loop. asyncpg connections are
+# loop-bound, so a connection pooled on one test's loop and reused on the next
+# raises "Task ... attached to a different loop". The production engine uses a
+# sized QueuePool; here we tell the engine factory to use NullPool so every
+# checkout opens a fresh connection on the current loop. Must be set before the
+# first ``import app...`` below builds the engine. The fast per-test isolation
+# helpers in ``tests/_pg.py`` already use NullPool for the same reason.
+os.environ.setdefault("OE_TEST_NULLPOOL", "1")
+
+import pytest  # noqa: E402
+
+import app.core.audit  # noqa: E402,F401
+
+# Audit-log model needs to be registered with Base.metadata before
+# create_all() so the FSM audit-log writes have somewhere to land.
+import app.core.audit_log  # noqa: E402,F401
+import app.modules.bim_hub.models  # noqa: E402,F401
+import app.modules.boq.models  # noqa: E402,F401
+import app.modules.eac.models  # noqa: E402,F401
+
+# ── Eagerly register all module ORM tables ─────────────────────────────────
+# Without this, test-order pollution can leave Base.metadata holding a
+# fragmentary view: e.g. a test that imports `schedule.models` but not
+# `projects.models` registers `oe_schedule_schedule` with a dangling FK
+# to the unloaded `oe_projects_project`. The next test that calls
+# `Base.metadata.create_all()` then fails with NoReferencedTableError.
+# Importing every module's models here once before any test runs
+# guarantees a coherent metadata snapshot regardless of suite order.
+import app.modules.projects.models  # noqa: E402,F401
+import app.modules.schedule.models  # noqa: E402,F401
+import app.modules.takeoff.models  # noqa: E402,F401
+import app.modules.users.models  # noqa: E402,F401
+
+# ── Synchronous event publishing in tests ──────────────────────────────────
+# Production wraps ``event_bus.publish`` in ``asyncio.create_task`` via
+# :meth:`EventBus.publish_detached` so the database connection isn't
+# held by the request session while subscribers open theirs. Tests, however,
+# typically do ``await service.X()`` then immediately assert on a captured
+# events fixture — the scheduled task hasn't yielded to the loop yet. To
+# preserve pre-v2.6.47 sync semantics for tests we shim ``publish_detached``
+# to use an immediate ``ensure_future`` + a ``run`` of pending callbacks
+# before returning, so when control comes back to the test's next line the
+# event has already fanned out to subscribers.
+from app.core.events import event_bus as _event_bus  # noqa: E402
+
+
+# Which subscribers must be driven by the event loop rather than stepped by hand
+# ---------------------------------------------------------------------------
+# This used to be a set of three handler names, kept by hand and documented with
+# "keep this in sync with every event_bus.subscribe('*', ...) in app/". It went
+# stale the way every such list does. It named only the three wildcard
+# subscribers, so all 150-odd *per-event* subscribers under app/ - each of which
+# opens its own database session, because that is the entire reason
+# ``publish_detached`` exists - were classified as pure and hand-stepped. One
+# leaked ``boq.position.created`` subscriber was enough to suspend a hand-stepped
+# coroutine inside a live asyncpg read and corrupt the session-scoped loop, and
+# every later test in that process then died in ``selectors.py`` without ever
+# reaching application code.
+#
+# The classification is therefore structural now, and derived from something the
+# author of a new subscriber cannot forget to update: the module the handler was
+# defined in. Anything defined under ``app.`` may do real I/O and is never
+# hand-stepped. A new ``event_bus.subscribe`` anywhere in the application is
+# covered the day it lands, and no test needs to know it exists.
+def _is_application_subscriber(handler: object) -> bool:
+    """True when *handler* was defined inside the application package."""
+    module = getattr(handler, "__module__", "") or ""
+    return module == "app" or module.startswith("app.")
+
+
+def _needs_event_loop(handler: object) -> bool:
+    """True when stepping *handler* by hand would suspend the publish coroutine."""
+    if _is_application_subscriber(handler):
+        return True
+    # A plain (non-async) subscriber is dispatched through ``asyncio.to_thread``
+    # by :meth:`EventBus.publish`, which suspends the publish coroutine even
+    # though the handler itself touches nothing. Ask the same question the bus
+    # asks, so the two can never disagree.
+    return not inspect.iscoroutinefunction(handler)
+
+
+# Set per test by :func:`_isolate_unit_tests_from_leaked_subscribers` below.
+_unit_test_scope = False
+
+# Keep strong references to scheduled publish tasks so the loop can't garbage-
+# collect them mid-flight (which would raise "Task was destroyed but it is
+# pending"). The done-callback drops each task once it finishes.
+_pending_event_tasks: set = set()
+
+
+def _schedule_publish(coro):
+    import asyncio as __asyncio
+
+    task = __asyncio.ensure_future(coro)
+    _pending_event_tasks.add(task)
+    task.add_done_callback(_pending_event_tasks.discard)
+    return task
+
+
+def _drive_in_line(name, data, source_module, named, wildcard):
+    """Fan *name* out synchronously to the vetted handler set, and only to it.
+
+    Every handler passed here answered ``False`` to :func:`_needs_event_loop`, so
+    :meth:`EventBus.publish` runs start to finish on a single ``send(None)`` and
+    the synchronous contract unit tests are written against holds.
+
+    The bus registries hold the vetted set for the duration of that one step, so
+    ``publish`` fans out to exactly what we vetted rather than to whatever is on
+    the bus. The window is invisible: the step is straight-line synchronous code
+    with no suspension point, so nothing else in the process can observe it. The
+    ``_handlers`` mapping itself is kept (only the one key is borrowed) so the
+    bus never changes shape.
+    """
+    import asyncio as __asyncio
+
+    fut: __asyncio.Future = __asyncio.Future()
+    had_key = name in _event_bus._handlers
+    saved_named = _event_bus._handlers.get(name)
+    saved_wildcard = _event_bus._wildcard_handlers
+    _event_bus._handlers[name] = named
+    _event_bus._wildcard_handlers = wildcard
+    try:
+        coro = _event_bus.publish(name, data, source_module=source_module)
+        try:
+            coro.send(None)
+        except StopIteration as stop:
+            fut.set_result(stop.value)
+            return fut
+        except BaseException as exc:
+            fut.set_exception(exc)
+            return fut
+    finally:
+        if had_key:
+            _event_bus._handlers[name] = saved_named
+        else:
+            _event_bus._handlers.pop(name, None)
+        _event_bus._wildcard_handlers = saved_wildcard
+
+    # Unreachable by construction, and loud rather than silent if construction
+    # ever slips. The old code closed the half-stepped coroutine here and
+    # re-published, which is unsound twice over: ``close()`` throws GeneratorExit
+    # into a coroutine that may be suspended inside asyncpg, abandoning a socket
+    # that is still registered on the session-scoped loop, and the re-publish
+    # fires again every handler that already completed. Closing is safe *here*
+    # because no application subscriber can be in this set - that is what
+    # :func:`_needs_event_loop` guarantees - so what is left is a test-owned
+    # handler that awaited something, and the test author is the one who can fix
+    # it. Fail at the publish site rather than poisoning a later test.
+    coro.close()
+    raise RuntimeError(
+        f"event {name!r} suspended while being published in line; handlers "
+        f"{[getattr(h, '__qualname__', repr(h)) for h in named + wildcard]} were "
+        "all classified as unable to suspend. A subscriber registered by a test "
+        "awaited real I/O: subscribe it from the application package, or make it "
+        "complete without awaiting."
+    )
+
+
+def _sync_publish_detached(name, data=None, source_module=None):
+    """Test-time replacement for :meth:`EventBus.publish_detached`.
+
+    Two regimes, chosen by :func:`_needs_event_loop` over the handlers actually
+    registered for the event, in *both* bus registries:
+
+    * **Unit tests** subscribe a pure-Python recorder to the bus, call a service
+      that fires ``publish_detached`` and then immediately assert on the captured
+      events. Nothing on that path does I/O, so the publish coroutine is driven
+      to completion in line, preserving that synchronous contract exactly.
+
+    * **Integration tests** run the full app, whose subscribers open their own DB
+      session. Those do real asyncpg I/O; stepping them by hand corrupts the
+      connection. So the publish is scheduled as a detached task, exactly as
+      production does, and the loop drives the I/O correctly.
+
+    Either way an awaitable is returned for callers/tests that use it.
+    """
+    named = list(_event_bus._handlers.get(name, ()))
+    wildcard = list(_event_bus._wildcard_handlers)
+    if _unit_test_scope:
+        # A unit test never started the app, so every application subscriber on
+        # the bus is leakage from some earlier test that imported a module and
+        # did not put the bus back. Leave it registered - tests that assert on
+        # the wiring need to see it - but keep it out of this publish, so it
+        # neither runs nor decides the regime.
+        named = [h for h in named if not _is_application_subscriber(h)]
+        wildcard = [h for h in wildcard if not _is_application_subscriber(h)]
+
+    if any(_needs_event_loop(h) for h in named + wildcard):
+        try:
+            # Deliberately the unfiltered publish: once the loop is driving it,
+            # a leaked subscriber doing its own I/O is merely unwanted, never
+            # corrupting, and re-deriving the fan-out here would duplicate
+            # ``EventBus.publish`` in the harness.
+            return _schedule_publish(_event_bus.publish(name, data, source_module=source_module))
+        except RuntimeError:
+            # No running loop (rare): ``publish_detached`` was called from plain
+            # synchronous code. Nothing can drive a handler that suspends, and
+            # hand-stepping one is the corruption this shim exists to prevent,
+            # so deliver to the handlers that can complete in line and skip the
+            # rest rather than half-running them.
+            named = [h for h in named if not _needs_event_loop(h)]
+            wildcard = [h for h in wildcard if not _needs_event_loop(h)]
+
+    return _drive_in_line(name, data, source_module, named, wildcard)
+
+
+_event_bus.publish_detached = _sync_publish_detached  # type: ignore[method-assign]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_unit_tests_from_leaked_subscribers(request):
+    """Keep a leaked application subscriber out of a unit test's publishes.
+
+    ``_sync_publish_detached`` above picks its regime from what is on the bus:
+    with a subscriber that does real I/O registered it schedules the publish on
+    the loop, and every pure recorder goes with it. That is correct for an
+    integration test, which starts the app and wants those handlers to run, and
+    wrong for a unit test, which subscribes a recorder and asserts on it on the
+    very next line with no await in between.
+
+    Nothing removes those handlers once registered. So a single test that
+    subscribed one and did not unsubscribe silently flipped every unit test that
+    ran after it onto the loop regime, and they failed on an empty recorder in
+    an unrelated module, hundreds of tests away from the cause and green again
+    the moment that file was run on its own. ``test_dashboards_t01_service.py``
+    was the one that surfaced it, on ``assert 'snapshot.created' in []``.
+
+    Unit tests never start the app, so for them these handlers are always
+    leakage. This fixture marks the scope; the exclusion itself happens in
+    ``_sync_publish_detached`` and covers **both** registries, the per-event
+    ``_handlers`` as well as the ``"*"`` ``_wildcard_handlers``. The predecessor
+    of this fixture looked only at the wildcard list, which is how a leaked
+    ``boq.position.created`` subscriber survived and got hand-stepped into a live
+    asyncpg read, corrupting the session-scoped loop for the rest of the process.
+
+    Excluding at the publish boundary rather than deleting from the bus is
+    deliberate. Deleting would make every test that asserts on the wiring
+    order-dependent: ``test_doc_assistant_wiring.py`` imports its events modules
+    *inside* the test body, so run alone it re-registers after the deletion and
+    passes, and run in a chunk the import is a no-op and it fails. Shipping a
+    fresh instance of the bug class we are removing is not a fix. So the bus
+    keeps its handlers and the publish simply does not fan out to them.
+    """
+    global _unit_test_scope
+
+    path = str(getattr(request.node, "fspath", "")).replace("\\", "/")
+    previous = _unit_test_scope
+    _unit_test_scope = "/tests/unit/" in path
+    try:
+        yield
+    finally:
+        _unit_test_scope = previous
+
+
+@pytest.fixture(autouse=True)
+def _keep_validation_rules_registered():
+    """Guard the process-global validation registry against cross-test pollution.
+
+    A few suites swap the module-level ``validation_engine`` or replace/empty its
+    registry to exercise edge cases; without a restore, a later test that runs a
+    real rule set - inline BOQ-import validation, the pipeline graph gate - finds
+    an empty registry and reports every requested set as ``unsupported``. After
+    each test put the engine and its registry back, and re-register the built-ins
+    if they went missing (``register_builtin_rules`` is idempotent).
+
+    Registering on the way IN matters just as much, and used to be missing. The
+    application calls ``register_builtin_rules`` from its lifespan, which no test
+    process starts, so the registry began every run empty and was populated only
+    as a side effect of this fixture's teardown. The first test in the process to
+    ask for a rule set therefore got nothing: the engine marks an absent set as
+    unsupported and returns a clean report, which is indistinguishable from the
+    rules having run and found no problem. Whether a validation test was real then
+    depended on where pytest happened to order it. Measured 2026-07-27 with
+    ``tests/unit/test_validation_registry_populated.py``, which saw the registry
+    holding ``[]`` at the first test and every built-in set present by the second.
+    """
+    import app.core.validation.engine as _eng
+
+    engine = _eng.validation_engine
+    registry = engine.registry
+    if "boq_quality" not in registry.list_rule_sets():
+        from app.core.validation.rules import register_builtin_rules
+
+        register_builtin_rules()
+    try:
+        yield
+    finally:
+        _eng.validation_engine = engine
+        engine.registry = registry
+        if "boq_quality" not in registry.list_rule_sets():
+            from app.core.validation.rules import register_builtin_rules
+
+            register_builtin_rules()
+
+
+@pytest.fixture
+def sample_boq_data():
+    """Sample BOQ data for validation tests."""
+    return {
+        "positions": [
+            {
+                "id": "pos-001",
+                "ordinal": "01.01.0010",
+                "description": "Stahlbeton C30/37 für Fundamente",
+                "unit": "m3",
+                "quantity": 44.30,
+                "unit_rate": 185.00,
+                "classification": {"din276": "330", "masterformat": "03 30 00"},
+            },
+            {
+                "id": "pos-002",
+                "ordinal": "01.01.0020",
+                "description": "Schalung für Fundamente",
+                "unit": "m2",
+                "quantity": 120.0,
+                "unit_rate": 42.50,
+                "classification": {"din276": "330"},
+            },
+            {
+                "id": "pos-003",
+                "ordinal": "01.02.0010",
+                "description": "Betonstahl BSt 500 S",
+                "unit": "kg",
+                "quantity": 3200.0,
+                "unit_rate": 1.85,
+                "classification": {"din276": "330"},
+            },
+        ]
+    }
+
+
+@pytest.fixture
+def sample_boq_data_with_issues():
+    """BOQ data with validation issues."""
+    return {
+        "positions": [
+            {
+                "id": "pos-001",
+                "ordinal": "01.01.0010",
+                "description": "Good position",
+                "unit": "m3",
+                "quantity": 10.0,
+                "unit_rate": 100.0,
+                "classification": {"din276": "330"},
+            },
+            {
+                "id": "pos-002",
+                "ordinal": "01.01.0010",  # DUPLICATE ordinal
+                "description": "",  # MISSING description
+                "unit": "m2",
+                "quantity": 0,  # ZERO quantity
+                "unit_rate": 0,  # ZERO rate
+                "classification": {},  # MISSING classification
+            },
+            {
+                "id": "pos-003",
+                "ordinal": "01.02.0010",
+                "description": "Overpriced item",
+                "unit": "pcs",
+                "quantity": 5.0,
+                "unit_rate": 999999.0,  # ANOMALY
+                "classification": {"din276": "999"},  # INVALID code
+            },
+        ]
+    }
+
+
+@pytest.fixture
+def sample_cad_elements():
+    """Sample CAD canonical format elements."""
+    return [
+        {
+            "id": "elem_001",
+            "category": "wall",
+            "classification": {"din276": "330"},
+            "geometry": {
+                "type": "extrusion",
+                "length_m": 12.43,
+                "height_m": 3.0,
+                "thickness_m": 0.24,
+                "area_m2": 37.29,
+                "volume_m3": 8.95,
+            },
+            "properties": {"material": "concrete_c30_37"},
+            "quantities": {"area": 37.29, "volume": 8.95},
+        },
+        {
+            "id": "elem_002",
+            "category": "floor",
+            "classification": {"din276": "350"},
+            "geometry": {
+                "type": "slab",
+                "area_m2": 85.0,
+                "thickness_m": 0.20,
+                "volume_m3": 17.0,
+            },
+            "properties": {"material": "concrete_c25_30"},
+            "quantities": {"area": 85.0, "volume": 17.0},
+        },
+    ]
